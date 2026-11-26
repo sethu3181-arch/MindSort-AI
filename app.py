@@ -821,7 +821,7 @@ backup_app.launch(share=False)
 # COMPLETE INTEGRATED APPLICATION
 # ============================================================
 
-!pip -q install gradio scikit-learn pandas matplotlib
+
 
 import os
 import re
