@@ -60,7 +60,6 @@ print("\nStage 16 completed successfully!")
 # UNIFIED DASHBOARD
 # =====================================================
 
-!pip install -q gradio
 
 import gradio as gr
 import sqlite3
