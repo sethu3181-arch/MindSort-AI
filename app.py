@@ -463,8 +463,7 @@ def gmail_oauth_callback(request: Request):
             "<p>Return to MindSort AI and start the connection again.</p>",
             status_code=400
         )
-
-        try:
+    try:
         flow = make_google_flow(state=state)
         flow.fetch_token(code=code)
         credentials = flow.credentials
@@ -498,7 +497,7 @@ def gmail_oauth_callback(request: Request):
             "<p>Check the Render logs for the error.</p>",
             status_code=400
         )
-
+        
 def gmail_connection_status():
     lines = ["## Gmail connections"]
     for slot in ("Gmail account 1", "Gmail account 2"):
