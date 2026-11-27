@@ -1,7 +1,7 @@
 gradio
-scikit-learn
+fastapi
+uvicorn
 pandas
-matplotlib
-google-api-python-client
+scikit-learn
 google-auth-oauthlib
-google-auth-httplib2
+google-api-python-client
