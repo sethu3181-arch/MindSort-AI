@@ -2,3 +2,6 @@ gradio
 scikit-learn
 pandas
 matplotlib
+google-api-python-client
+google-auth-oauthlib
+google-auth-httplib2
