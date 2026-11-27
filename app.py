@@ -431,7 +431,8 @@ def start_gmail_connection(account_slot):
         )
         pending_oauth[state] = {
             "account_slot": account_slot,
-            "created_at": time.time()
+            "created_at": time.time(),
+            "flow": flow
         }
         return (
             f"### Connect {account_slot}\n\n"
@@ -464,7 +465,7 @@ def gmail_oauth_callback(request: Request):
             status_code=400
         )
     try:
-        flow = make_google_flow(state=state)
+        flow = pending["flow"]
         flow.fetch_token(code=code)
         credentials = flow.credentials
 
