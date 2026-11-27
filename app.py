@@ -22,7 +22,8 @@ from datetime import datetime, timedelta
 
 import gradio as gr
 import pandas as pd
-from fastapi import Request
+from fastapi import FastAPI, Request
+import uvicorn
 from fastapi.responses import HTMLResponse
 from google_auth_oauthlib.flow import Flow
 from googleapiclient.discovery import build
@@ -909,7 +910,9 @@ with gr.Blocks(
 
 
 # Register Google's OAuth callback on the same FastAPI app used by Gradio.
-app.app.add_api_route(
+# Our own FastAPI server holds the OAuth callback; Gradio is mounted onto it.
+server = FastAPI()
+server.add_api_route(
     "/oauth2callback",
     gmail_oauth_callback,
     methods=["GET"],
@@ -938,8 +941,11 @@ if __name__ == "__main__":
             "Set a longer unique password in Render."
         )
 
-    app.launch(
-        server_name="0.0.0.0",
-        server_port=int(os.environ.get("PORT", 10000)),
-        auth=(username, password)
+        mounted = gr.mount_gradio_app(
+        server, app, path="/", auth=(username, password)
+    )
+    uvicorn.run(
+        mounted,
+        host="0.0.0.0",
+        port=int(os.environ.get("PORT", 10000))
     )
