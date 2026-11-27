@@ -1,96 +1,127 @@
-# ============================================================
-# MINDSORT AI - SECURED DEPLOYMENT VERSION
-# ============================================================
-# All eight existing tabs are preserved.
-#
-# SECURITY:
-# Set these environment variables in Render:
-#   MINDSORT_USERNAME = your chosen login username
-#   MINDSORT_PASSWORD = a long, unique password
-#
-# Never put your password in this file or commit it to GitHub.
-# ============================================================
-
-import os
-import sqlite3
-import tempfile
-from datetime import datetime, timedelta
-
-import gradio as gr
-import pandas as pd
-from sklearn.feature_extraction.text import TfidfVectorizer
-from sklearn.naive_bayes import MultinomialNB
-from sklearn.pipeline import Pipeline
-
-
-# ============================================================
-# 1. CONFIGURATION
-# ============================================================
-
-DB = os.environ.get("MINDSORT_DB_PATH", "mindsort.db")
-MAX_MESSAGE_LENGTH = 5000
-
-
-# ============================================================
-# 2. DATABASE
-# ============================================================
-
-def connect_db():
-    return sqlite3.connect(DB, check_same_thread=False, timeout=30)
-
-
-def setup_database():
-    conn = connect_db()
-    cursor = conn.cursor()
-
-    cursor.execute("""
-        CREATE TABLE IF NOT EXISTS messages (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            message TEXT,
-            category TEXT,
-            is_task TEXT,
-            deadline TEXT,
-            priority TEXT DEFAULT 'Normal',
-            completed INTEGER DEFAULT 0,
-            created_at TEXT
-        )
-    """)
-
-    existing_columns = [
-        row[1] for row in cursor.execute(
-            "PRAGMA table_info(messages)"
-        ).fetchall()
-    ]
-
-    required_columns = {
-        "priority": "TEXT DEFAULT 'Normal'",
-        "completed": "INTEGER DEFAULT 0",
-        "created_at": "TEXT"
-    }
-
-    for column, definition in required_columns.items():
-        if column not in existing_columns:
-            cursor.execute(
-                f"ALTER TABLE messages ADD COLUMN {column} {definition}"
+                outputs=task_output
             )
 
-    conn.commit()
-    conn.close()
+            task_id = gr.Number(
+                label="Task ID to complete",
+                precision=0
+            )
 
+            complete_button = gr.Button("Mark Completed")
+            complete_output = gr.Textbox()
 
-setup_database()
+            complete_button.click(
+                complete_task,
+                inputs=task_id,
+                outputs=complete_output
+            )
+
+        # SEARCH
+        with gr.Tab("🔍 Search"):
+            keyword = gr.Textbox(label="Search keyword")
+
+            category = gr.Dropdown(
+                ["All", "Study", "Hackathon", "Events", "Work", "Home"],
+                value="All",
+                label="Category"
+            )
+
+            priority = gr.Dropdown(
+                ["All", "High", "Medium", "Low", "Normal"],
+                value="All",
+                label="Priority"
+            )
+
+            search_button = gr.Button("Search")
+            search_output = gr.Dataframe()
+
+            search_button.click(
+                advanced_search,
+                inputs=[keyword, category, priority],
+                outputs=search_output
+            )
+
+        # DASHBOARD
+        with gr.Tab("📊 Dashboard"):
+            dashboard_button = gr.Button("Refresh Dashboard")
+            dashboard_output = gr.Markdown()
+
+            dashboard_button.click(
+                dashboard,
+                outputs=dashboard_output
+            )
+
+        # EXPORT
+        with gr.Tab("📥 Export"):
+            export_button = gr.Button("Export CSV")
+            export_output = gr.File()
+
+            export_button.click(
+                export_messages,
+                outputs=export_output
+            )
+
+        # GMAIL
+        with gr.Tab("📧 Gmail"):
+            gmail_button = gr.Button("View Gmail Setup")
+            gmail_output = gr.Markdown()
+
+            gmail_button.click(
+                gmail_setup_information,
+                outputs=gmail_output
+            )
+
+        # TESTING
+        with gr.Tab("🧪 Testing"):
+            test_button = gr.Button("Run Tests")
+            test_output = gr.Textbox(lines=8)
+
+            test_button.click(
+                run_tests,
+                outputs=test_output
+            )
+
+        # DEPLOYMENT
+        with gr.Tab("🚀 Deployment"):
+            deployment_button = gr.Button(
+                "View Deployment Checklist"
+            )
+
+            deployment_output = gr.Markdown()
+
+            deployment_button.click(
+                deployment_information,
+                outputs=deployment_output
+            )
+
+    gr.Markdown("""
+    ---
+    **MindSort AI | Smart Message Management**
+    """)
 
 
 # ============================================================
-# 3. AI CLASSIFICATION MODEL
+# 14. START SERVER WITH LOGIN PROTECTION
 # ============================================================
 
-training_messages = [
-    "Complete mathematics homework",
-    "Submit physics assignment",
-    "Prepare for chemistry exam",
-    "Download class notes",
-    "Study for semester examination",
-    "Register for AI hackathon",
-    "Submit hackathon project",
-    "Attend hackathon team meeting",
+if __name__ == "__main__":
+    username = os.environ.get("MINDSORT_USERNAME")
+    password = os.environ.get("MINDSORT_PASSWORD")
+
+    if not username or not password:
+        raise RuntimeError(
+            "Login credentials are missing. In Render, add the "
+            "MINDSORT_USERNAME and MINDSORT_PASSWORD environment "
+            "variables, then redeploy."
+        )
+
+    if len(password) < 12:
+        raise RuntimeError(
+            "MINDSORT_PASSWORD must be at least 12 characters long. "
+            "Set a longer unique password in Render."
+        )
+
+    app.launch(
+        server_name="0.0.0.0",
+        server_port=int(os.environ.get("PORT", 10000)),
+        auth=(username, password)
+    )
