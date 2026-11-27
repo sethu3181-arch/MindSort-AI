@@ -464,20 +464,24 @@ def gmail_oauth_callback(request: Request):
             status_code=400
         )
 
-    try:
+        try:
         flow = make_google_flow(state=state)
         flow.fetch_token(code=code)
         credentials = flow.credentials
+
         service = build(
             "gmail", "v1", credentials=credentials,
             cache_discovery=False
         )
+
         profile = service.users().getProfile(userId="me").execute()
         gmail_address = profile.get("emailAddress", "Connected Google account")
+
         gmail_connections[pending["account_slot"]] = {
             "credentials": credentials,
             "email": gmail_address
         }
+
         return HTMLResponse(
             "<html><body style='font-family:Arial;padding:32px'>"
             "<h2>Gmail connected successfully!</h2>"
@@ -486,14 +490,14 @@ def gmail_oauth_callback(request: Request):
             "<p>You can close this tab and return to MindSort AI.</p>"
             "</body></html>"
         )
-        except Exception as error:
+
+    except Exception as error:
         print("GMAIL OAUTH CALLBACK ERROR:", repr(error), flush=True)
         return HTMLResponse(
             "<h2>Could not complete Gmail connection.</h2>"
             "<p>Check the Render logs for the error.</p>",
             status_code=400
         )
-
 
 def gmail_connection_status():
     lines = ["## Gmail connections"]
