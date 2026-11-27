@@ -440,6 +440,7 @@ def start_gmail_connection(account_slot):
             "Return here after approval."
         )
     except Exception as error:
+        
         return f"Could not start Google authorization: {str(error)}"
 
 
@@ -485,11 +486,11 @@ def gmail_oauth_callback(request: Request):
             "<p>You can close this tab and return to MindSort AI.</p>"
             "</body></html>"
         )
-    except Exception:
+        except Exception as error:
+        print("GMAIL OAUTH CALLBACK ERROR:", repr(error), flush=True)
         return HTMLResponse(
             "<h2>Could not complete Gmail connection.</h2>"
-            "<p>Return to MindSort AI and try connecting again. "
-            "No Gmail messages were changed.</p>",
+            "<p>Check the Render logs for the error.</p>",
             status_code=400
         )
 
