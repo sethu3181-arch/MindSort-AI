@@ -923,7 +923,6 @@ server.add_api_route(
 # ============================================================
 # 14. START SERVER WITH LOGIN PROTECTION
 # ============================================================
-
 if __name__ == "__main__":
     username = os.environ.get("MINDSORT_USERNAME")
     password = os.environ.get("MINDSORT_PASSWORD")
@@ -941,11 +940,14 @@ if __name__ == "__main__":
             "Set a longer unique password in Render."
         )
 
-        mounted = gr.mount_gradio_app(
+    mounted = gr.mount_gradio_app(
         server, app, path="/", auth=(username, password)
     )
+
     uvicorn.run(
         mounted,
         host="0.0.0.0",
         port=int(os.environ.get("PORT", 10000))
+    )
+
     )
