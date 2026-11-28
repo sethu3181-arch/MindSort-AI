@@ -1,7 +1,8 @@
 """
-MindSort AI - adaptive Gmail folders.
+MindSort AI - adaptive Gmail folders (multi-user version).
 
-Put this file next to your main app file.
+Every card belongs to one user_id, and every read filters by it.
+Put this file next to app.py. See the three edits in the chat.
 Nothing here writes to Gmail. It only reads data your app already fetched.
 """
 import html
@@ -18,9 +19,14 @@ def init(connect_db):
     global _connect
     _connect = connect_db
     conn = _connect()
+    cols = [r[1] for r in conn.execute("PRAGMA table_info(folder_cards)").fetchall()]
+    if cols and "user_id" not in cols:
+        # Old single-user table: drop it. Cards are rebuilt on the next inbox fetch.
+        conn.execute("DROP TABLE folder_cards")
     conn.execute("""
         CREATE TABLE IF NOT EXISTS folder_cards (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER NOT NULL,
             gmail_account TEXT NOT NULL,
             gmail_message_id TEXT NOT NULL,
             subject TEXT,
@@ -32,7 +38,7 @@ def init(connect_db):
             received_at TEXT,
             link TEXT,
             search_text TEXT,
-            UNIQUE(gmail_account, gmail_message_id)
+            UNIQUE(user_id, gmail_account, gmail_message_id)
         )
     """)
     conn.commit()
@@ -226,7 +232,7 @@ def extract_key_points(body, limit=3):
 # ------------------------------------------------------------
 # 4. SAVE A CARD (call from the Gmail import loop)
 # ------------------------------------------------------------
-def save_folder_card(cursor, account, message_id, subject, sender, body, received):
+def save_folder_card(cursor, user_id, account, message_id, subject, sender, body, received):
     """received: a datetime. Uses INSERT OR IGNORE so re-imports never duplicate."""
     body = body or ""
     full_text = f"{subject}\n{body}"
@@ -234,10 +240,10 @@ def save_folder_card(cursor, account, message_id, subject, sender, body, receive
     link = f"https://mail.google.com/mail/u/?authuser={quote(account)}#all/{message_id}"
     cursor.execute("""
         INSERT OR IGNORE INTO folder_cards
-        (gmail_account, gmail_message_id, subject, sender, folder, key_points,
-         open_date, close_date, received_at, link, search_text)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-    """, (account, message_id, subject, sender, classify_folder(subject, body),
+        (user_id, gmail_account, gmail_message_id, subject, sender, folder,
+         key_points, open_date, close_date, received_at, link, search_text)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    """, (user_id, account, message_id, subject, sender, classify_folder(subject, body),
           "\n".join(extract_key_points(body)), open_iso, close_iso,
           received.isoformat(), link, body[:1500]))
 
@@ -258,16 +264,26 @@ def _rows(sql, params=()):
     return rows
 
 
-def list_accounts():
+def has_card(cursor, user_id, account, message_id):
+    return cursor.execute(
+        "SELECT 1 FROM folder_cards WHERE user_id = ? AND gmail_account = ? "
+        "AND gmail_message_id = ?", (user_id, account, message_id)).fetchone() is not None
+
+
+def list_accounts(user_id):
+    if not user_id:
+        return []
     return [r[0] for r in _rows(
-        "SELECT DISTINCT gmail_account FROM folder_cards ORDER BY gmail_account")]
+        "SELECT DISTINCT gmail_account FROM folder_cards WHERE user_id = ? "
+        "ORDER BY gmail_account", (user_id,))]
 
 
-def folder_choices(account):
-    if not account:
+def folder_choices(user_id, account):
+    if not user_id or not account:
         return []
     rows = _rows("""SELECT folder, COUNT(*) AS n FROM folder_cards
-                    WHERE gmail_account = ? GROUP BY folder""", (account,))
+                    WHERE user_id = ? AND gmail_account = ? GROUP BY folder""",
+                 (user_id, account))
     rows = sorted(rows, key=lambda r: (r["folder"] == "Uncategorized", -r["n"]))
     return [f"{r['folder']} ({r['n']})" for r in rows]
 
@@ -312,13 +328,17 @@ STYLE = """<style>
 </style>"""
 
 
-def render_folder(account, folder_label, keyword, sort_by):
-    if not account or not folder_label:
+def message_html(text):
+    return STYLE + f'<div class="ms-empty">{html.escape(text)}</div>'
+
+
+def render_folder(user_id, account, folder_label, keyword, sort_by):
+    if not user_id or not account or not folder_label:
         return STYLE + '<div class="ms-empty">Choose an account and a folder to see its emails.</div>'
     folder = folder_label.rsplit(" (", 1)[0]
     rows = [dict(r) for r in _rows(
-        "SELECT * FROM folder_cards WHERE gmail_account = ? AND folder = ?",
-        (account, folder))]
+        "SELECT * FROM folder_cards WHERE user_id = ? AND gmail_account = ? "
+        "AND folder = ?", (user_id, account, folder))]
     kw = (keyword or "").strip().lower()
     if kw:
         rows = [r for r in rows if kw in " ".join(
@@ -355,24 +375,3 @@ def render_folder(account, folder_label, keyword, sort_by):
   </div>
 </div>""")
     return STYLE + f'<div class="ms-grid">{"".join(cards)}</div>'
-
-
-# ------------------------------------------------------------
-# 6. FUNCTIONS FOR THE GRADIO TAB
-# ------------------------------------------------------------
-def refresh_folders(account):
-    import gradio as gr
-    accounts = list_accounts()
-    if account not in accounts:
-        account = accounts[0] if accounts else None
-    choices = folder_choices(account)
-    msg = "" if choices else STYLE + (
-        '<div class="ms-empty">No folders yet. Go to the Gmail tab, fetch your inbox, '
-        'then press Refresh folders.</div>')
-    return (gr.update(choices=accounts, value=account),
-            gr.update(choices=choices, value=None), msg)
-
-
-def change_account(account):
-    import gradio as gr
-    return gr.update(choices=folder_choices(account), value=None), render_folder(account, None, "", "")
