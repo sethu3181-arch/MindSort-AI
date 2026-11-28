@@ -550,15 +550,30 @@ def fetch_and_organize_gmail(account_slot, max_emails):
 
     try:
         max_emails = int(max_emails or 10)
-        max_emails = max(1, min(max_emails, 25))
+        max_emails = max(1, min(max_emails, 100))
         service = build(
             "gmail", "v1", credentials=connection["credentials"],
             cache_discovery=False
         )
-        response = service.users().messages().list(
-            userId="me", labelIds=["INBOX"], maxResults=max_emails
-        ).execute()
-        message_refs = response.get("messages", [])
+                service = build(
+            "gmail", "v1", credentials=connection["credentials"],
+            cache_discovery=False
+        )
+        message_refs = []
+        page_token = None
+        while len(message_refs) < max_emails:
+            response = service.users().messages().list(
+                userId="me", labelIds=["INBOX"],
+                maxResults=min(100, max_emails - len(message_refs)),
+                pageToken=page_token
+            ).execute()
+            message_refs.extend(response.get("messages", []))
+            page_token = response.get("nextPageToken")
+            if not page_token:
+                break
+
+        if not message_refs:
+            return f"No inbox messages found in {account_slot}."
 
         if not message_refs:
             return f"No inbox messages found in {account_slot}."
@@ -887,7 +902,7 @@ with gr.Blocks(
                 label="Select connected inbox"
             )
             email_count = gr.Slider(
-                minimum=1, maximum=25, value=10, step=1,
+                minimum=1, maximum=100, value=25, step=1,
                 label="Number of recent inbox messages to process"
             )
             fetch_button = gr.Button("Fetch and organize inbox")
