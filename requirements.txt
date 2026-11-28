@@ -7,3 +7,4 @@ google-auth-oauthlib
 google-api-python-client
 itsdangerous
 python-multipart
+psycopg[binary]>=3.2,<4
