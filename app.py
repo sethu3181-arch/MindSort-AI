@@ -542,7 +542,6 @@ def decode_gmail_body(payload):
     walk(payload)
     return "\n".join(chunks).strip()
 
-
 def fetch_and_organize_gmail(account_slot, max_emails):
     connection = gmail_connections.get(account_slot)
     if not connection:
@@ -555,10 +554,7 @@ def fetch_and_organize_gmail(account_slot, max_emails):
             "gmail", "v1", credentials=connection["credentials"],
             cache_discovery=False
         )
-                service = build(
-            "gmail", "v1", credentials=connection["credentials"],
-            cache_discovery=False
-        )
+
         message_refs = []
         page_token = None
         while len(message_refs) < max_emails:
@@ -571,9 +567,6 @@ def fetch_and_organize_gmail(account_slot, max_emails):
             page_token = response.get("nextPageToken")
             if not page_token:
                 break
-
-        if not message_refs:
-            return f"No inbox messages found in {account_slot}."
 
         if not message_refs:
             return f"No inbox messages found in {account_slot}."
@@ -606,7 +599,6 @@ def fetch_and_organize_gmail(account_slot, max_emails):
             )
 
             category_name, confidence = classify_message(content)
-            
             priority = detect_priority(content)
             task = detect_task(content)
             deadline = detect_deadline(content)
