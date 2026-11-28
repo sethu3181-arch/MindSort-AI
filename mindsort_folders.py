@@ -15,14 +15,19 @@ _connect = None
 
 
 def init(connect_db):
-    """Give this module your app's connect_db function and create the table."""
+    """Initialize private folder cards and private training examples."""
     global _connect
     _connect = connect_db
+
     conn = _connect()
-    cols = [r[1] for r in conn.execute("PRAGMA table_info(folder_cards)").fetchall()]
+    cols = [
+        r[1] for r in
+        conn.execute("PRAGMA table_info(folder_cards)").fetchall()
+    ]
+
     if cols and "user_id" not in cols:
-        # Old single-user table: drop it. Cards are rebuilt on the next inbox fetch.
         conn.execute("DROP TABLE folder_cards")
+
     conn.execute("""
         CREATE TABLE IF NOT EXISTS folder_cards (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -38,9 +43,36 @@ def init(connect_db):
             received_at TEXT,
             link TEXT,
             search_text TEXT,
+            is_corrected INTEGER DEFAULT 0,
             UNIQUE(user_id, gmail_account, gmail_message_id)
         )
     """)
+
+    cols = [
+        r[1] for r in
+        conn.execute("PRAGMA table_info(folder_cards)").fetchall()
+    ]
+    if "is_corrected" not in cols:
+        conn.execute(
+            "ALTER TABLE folder_cards ADD COLUMN is_corrected INTEGER DEFAULT 0"
+        )
+
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS training_examples (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER NOT NULL,
+            example_text TEXT NOT NULL,
+            target_folder TEXT NOT NULL,
+            source TEXT DEFAULT 'correction',
+            created_at TEXT
+        )
+    """)
+
+    conn.execute("""
+        CREATE INDEX IF NOT EXISTS idx_training_user
+        ON training_examples(user_id)
+    """)
+
     conn.commit()
     conn.close()
 
@@ -85,14 +117,76 @@ def _hits(text, keywords):
     return sum(1 for k in keywords if re.search(r"\b" + re.escape(k), text))
 
 
-def classify_folder(subject, body):
-    subject, body = (subject or "").lower(), (body or "").lower()[:3000]
-    best, best_score = "Uncategorized", 0.0
+def classify_folder(subject, body, user_id=None):
+    """
+    Combine the original folder rules with examples learned
+    only from the specified user's corrections.
+    """
+    subject = (subject or "").lower()
+    body = (body or "").lower()[:3000]
+    full_text = subject + " " + body
+
+    scores = {}
     for folder, words in FOLDER_RULES.items():
-        score = (2 * _hits(subject, words) + _hits(body, words)) * WEIGHT.get(folder, 1)
-        if score > best_score:
-            best, best_score = folder, score
-    return best if best_score >= MIN_SCORE else "Uncategorized"
+        score = (
+            2 * _hits(subject, words) + _hits(body, words)
+        ) * WEIGHT.get(folder, 1)
+        scores[folder] = score
+
+    # Learn from this user's own saved examples only.
+    if user_id and _connect:
+        examples = _rows(
+            """
+            SELECT example_text, target_folder
+            FROM training_examples
+            WHERE user_id = ?
+            """,
+            (user_id,)
+        )
+
+        stop_words = {
+            "the", "and", "for", "you", "your", "are", "with",
+            "this", "that", "from", "have", "has", "will", "our",
+            "about", "please", "dear", "hello", "regards"
+        }
+
+        current_words = {
+            w for w in re.findall(r"[a-z0-9]{3,}", full_text)
+            if w not in stop_words
+        }
+
+        for example in examples:
+            target = example["target_folder"]
+            if target not in FOLDER_RULES:
+                continue
+
+            example_words = {
+                w for w in re.findall(
+                    r"[a-z0-9]{3,}",
+                    (example["example_text"] or "").lower()
+                )
+                if w not in stop_words
+            }
+
+            if not current_words or not example_words:
+                continue
+
+            overlap = current_words.intersection(example_words)
+
+            if len(overlap) >= 2:
+                similarity = len(overlap) / max(
+                    1, len(example_words) ** 0.5
+                )
+                scores[target] = max(
+                    scores.get(target, 0),
+                    2.5 + similarity * 2
+                )
+
+    if not scores:
+        return "Uncategorized"
+
+    best = max(scores, key=scores.get)
+    return best if scores[best] >= MIN_SCORE else "Uncategorized"
 
 
 # ------------------------------------------------------------
@@ -243,11 +337,185 @@ def save_folder_card(cursor, user_id, account, message_id, subject, sender, body
         (user_id, gmail_account, gmail_message_id, subject, sender, folder,
          key_points, open_date, close_date, received_at, link, search_text)
         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-    """, (user_id, account, message_id, subject, sender, classify_folder(subject, body),
+        """, (user_id, account, message_id, subject, sender,
+                    classify_folder(subject, body, user_id),
           "\n".join(extract_key_points(body)), open_iso, close_iso,
           received.isoformat(), link, body[:1500]))
 
+# ------------------------------------------------------------
+# 5. PERSONAL TRAINING CENTER
+# ------------------------------------------------------------
 
+def training_card_choices(user_id):
+    """Return only the signed-in user's email cards."""
+    if not user_id:
+        return []
+
+    rows = _rows("""
+        SELECT id, subject, sender, folder
+        FROM folder_cards
+        WHERE user_id = ?
+        ORDER BY received_at DESC
+        LIMIT 200
+    """, (user_id,))
+
+    return [
+        (
+            f"{r['subject'] or '(No subject)'} | "
+            f"{r['folder'] or 'Uncategorized'} | "
+            f"{r['sender'] or 'Unknown sender'}",
+            str(r["id"])
+        )
+        for r in rows
+    ]
+
+
+def get_training_card(user_id, card_id):
+    """Show one selected email, only if it belongs to this user."""
+    if not user_id or not card_id:
+        return "Choose an email first."
+
+    try:
+        card_id = int(card_id)
+    except (TypeError, ValueError):
+        return "Please choose a valid email."
+
+    rows = _rows("""
+        SELECT subject, sender, folder, search_text, key_points
+        FROM folder_cards
+        WHERE id = ? AND user_id = ?
+        LIMIT 1
+    """, (card_id, user_id))
+
+    if not rows:
+        return "Email not found in your account."
+
+    r = rows[0]
+    return (
+        f"### {r['subject'] or '(No subject)'}\n\n"
+        f"**From:** {r['sender'] or 'Unknown sender'}\n\n"
+        f"**Current folder:** {r['folder'] or 'Uncategorized'}\n\n"
+        f"**Email text:**\n\n"
+        f"{(r['search_text'] or '')[:1500]}\n\n"
+        f"**Key points:**\n\n"
+        f"{r['key_points'] or 'No key points detected.'}"
+    )
+
+
+def correct_card(user_id, card_id, target_folder):
+    """Save a private correction and update that user's selected card."""
+    allowed = list(FOLDER_RULES.keys()) + ["Uncategorized"]
+
+    if not user_id:
+        return "Please log in again."
+
+    if target_folder not in allowed:
+        return "Please choose a valid folder."
+
+    try:
+        card_id = int(card_id)
+    except (TypeError, ValueError):
+        return "Please select an email first."
+
+    conn = _connect()
+    cursor = conn.cursor()
+
+    row = cursor.execute("""
+        SELECT subject, search_text
+        FROM folder_cards
+        WHERE id = ? AND user_id = ?
+    """, (card_id, user_id)).fetchone()
+
+    if not row:
+        conn.close()
+        return "That email was not found in your account."
+
+    subject, body = row[0] or "", row[1] or ""
+    example_text = (subject + " " + body).strip()[:2000]
+
+    cursor.execute("""
+        UPDATE folder_cards
+        SET folder = ?, is_corrected = 1
+        WHERE id = ? AND user_id = ?
+    """, (target_folder, card_id, user_id))
+
+    cursor.execute("""
+        INSERT INTO training_examples
+        (user_id, example_text, target_folder, source, created_at)
+        VALUES (?, ?, ?, 'correction', ?)
+    """, (
+        user_id,
+        example_text,
+        target_folder,
+        datetime.now().isoformat(timespec="seconds")
+    ))
+
+    conn.commit()
+    conn.close()
+
+    return (
+        f"Correction saved! This email is now in **{target_folder}**.\n\n"
+        "Your personal classifier can use this example for future emails. "
+        "It is not shared with other accounts."
+    )
+
+
+def reclassify_user_cards(user_id):
+    """Reclassify this user's old cards, but never overwrite corrections."""
+    if not user_id:
+        return "Please log in again."
+
+    conn = _connect()
+    cursor = conn.cursor()
+
+    rows = cursor.execute("""
+        SELECT id, subject, search_text
+        FROM folder_cards
+        WHERE user_id = ? AND COALESCE(is_corrected, 0) = 0
+    """, (user_id,)).fetchall()
+
+    changed = 0
+    for card_id, subject, body in rows:
+        new_folder = classify_folder(subject, body, user_id)
+        cursor.execute("""
+            UPDATE folder_cards
+            SET folder = ?
+            WHERE id = ? AND user_id = ?
+              AND COALESCE(is_corrected, 0) = 0
+        """, (new_folder, card_id, user_id))
+        changed += cursor.rowcount
+
+    conn.commit()
+    conn.close()
+
+    return (
+        f"Reclassification complete. Updated {changed} of your emails. "
+        "Your manually corrected emails were protected."
+    )
+
+
+def training_summary(user_id):
+    """Show the number of private examples saved for this user."""
+    if not user_id:
+        return "Please log in again."
+
+    rows = _rows("""
+        SELECT target_folder, COUNT(*) AS total
+        FROM training_examples
+        WHERE user_id = ?
+        GROUP BY target_folder
+        ORDER BY total DESC
+    """, (user_id,))
+
+    if not rows:
+        return "No personal training examples yet. Correct an email to begin."
+
+    total = sum(r["total"] for r in rows)
+    details = "\n".join(
+        f"- **{r['target_folder']}:** {r['total']} example(s)"
+        for r in rows
+    )
+    return f"### Your personal learning examples: {total}\n\n{details}"
 # ------------------------------------------------------------
 # 5. READING FOLDERS AND DRAWING CARDS
 # ------------------------------------------------------------
