@@ -800,6 +800,69 @@ def who_am_i(request: gr.Request):
 
 
 # ============================================================
+# PERSONAL TRAINING CENTER HANDLERS
+# ============================================================
+
+def training_refresh(request: gr.Request):
+    user_id = current_user_id(request)
+
+    if not user_id:
+        return (
+            gr.update(choices=[], value=None),
+            "Please log in again.",
+            LOGIN_AGAIN
+        )
+
+    choices = folders.training_card_choices(user_id)
+    selected = choices[0][1] if choices else None
+
+    details = (
+        folders.get_training_card(user_id, selected)
+        if selected
+        else "No imported emails found yet. Fetch your Gmail inbox first."
+    )
+
+    summary = folders.training_summary(user_id)
+
+    return gr.update(choices=choices, value=selected), details, summary
+
+
+def training_select_card(card_id, request: gr.Request):
+    user_id = current_user_id(request)
+
+    if not user_id:
+        return LOGIN_AGAIN
+
+    return folders.get_training_card(user_id, card_id)
+
+
+def training_save_correction(card_id, target_folder, request: gr.Request):
+    user_id = current_user_id(request)
+
+    if not user_id:
+        return LOGIN_AGAIN
+
+    return folders.correct_card(user_id, card_id, target_folder)
+
+
+def training_reclassify(request: gr.Request):
+    user_id = current_user_id(request)
+
+    if not user_id:
+        return LOGIN_AGAIN
+
+    return folders.reclassify_user_cards(user_id)
+
+
+def training_update_summary(request: gr.Request):
+    user_id = current_user_id(request)
+
+    if not user_id:
+        return LOGIN_AGAIN
+
+    return folders.training_summary(user_id)
+
+# ============================================================
 # 14. GRADIO USER INTERFACE
 # ============================================================
 
@@ -932,6 +995,92 @@ with gr.Blocks(title="MindSort AI", theme=gr.themes.Soft()) as app:
             fc_folders.change(folders_show, show, fc_cards)
             fc_keyword.submit(folders_show, show, fc_cards)
             fc_sort.change(folders_show, show, fc_cards)
+
+       
+       # PERSONAL TRAINING CENTER
+       with gr.Tab("🧠 Training Center"):
+           gr.Markdown("""
+           ## Teach MindSort AI your preferences
+
+           Select an imported email, choose the correct folder,
+           and save your correction.
+
+           Your training examples are private to your account.
+           """)
+
+           training_refresh_button = gr.Button("Refresh My Emails")
+
+           training_email = gr.Dropdown(
+               choices=[],
+               label="Choose an email to correct"
+           )
+
+           training_details = gr.Markdown(
+               "Refresh your emails to begin."
+           )
+
+           training_email.change(
+               training_select_card,
+               inputs=training_email,
+               outputs=training_details
+           )
+
+           training_folder = gr.Dropdown(
+               choices=list(folders.FOLDER_RULES.keys()) + ["Uncategorized"],
+               value="Hackathon",
+               label="Correct folder"
+           )
+
+           training_correct_button = gr.Button(
+               "Save Correction and Learn",
+               variant="primary"
+           )
+
+           training_result = gr.Markdown()
+
+           training_correct_button.click(
+               training_save_correction,
+               inputs=[training_email, training_folder],
+               outputs=training_result
+           )
+
+           gr.Markdown("---")
+           gr.Markdown("## Reclassify older emails")
+
+           training_reclassify_button = gr.Button(
+               "Reclassify My Existing Emails"
+           )
+
+           training_reclassify_result = gr.Markdown()
+
+           training_reclassify_button.click(
+               training_reclassify,
+               outputs=training_reclassify_result
+           )
+
+           gr.Markdown("---")
+           gr.Markdown("## My personal learning examples")
+
+           training_summary_output = gr.Markdown()
+
+           training_summary_button = gr.Button(
+               "Refresh Learning Summary"
+           )
+
+           training_summary_button.click(
+               training_update_summary,
+               outputs=training_summary_output
+           )
+
+           training_refresh_button.click(
+               training_refresh,
+               outputs=[
+                   training_email,
+                   training_details,
+                   training_summary_output
+               ]
+           )
+
 
         # TESTING
         with gr.Tab("🧪 Testing"):
