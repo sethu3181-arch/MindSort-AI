@@ -1,35 +1,43 @@
 # ============================================================
-# MINDSORT AI - SECURED DEPLOYMENT VERSION
+# MINDSORT AI - MULTI-USER VERSION
 # ============================================================
-# All eight existing tabs are preserved.
+# Every person signs up with their own username and password and
+# connects their own Gmail. Messages, folders and Gmail connections
+# are stored per user and never shown to anyone else.
 #
-# SECURITY:
-# Set these environment variables in Render:
-#   MINDSORT_USERNAME = your chosen login username
-#   MINDSORT_PASSWORD = a long, unique password
+# Files needed in the repo: app.py, mindsort_auth.py, mindsort_folders.py
 #
-# Never put your password in this file or commit it to GitHub.
+# Optional Render environment variables:
+#   MINDSORT_SECRET_KEY      long random text (keeps logins valid after restarts)
+#   MINDSORT_INVITE_CODE     if set, new accounts need this code to sign up
+#   MINDSORT_OWNER_USERNAME  your username; it adopts messages saved before this upgrade
+#   MINDSORT_DB_PATH         e.g. /var/data/mindsort.db (on a Render Disk)
+#   GOOGLE_CLIENT_ID / GOOGLE_CLIENT_SECRET  as before
 # ============================================================
 
+import base64
 import os
+import secrets
 import sqlite3
 import tempfile
-import base64
-import secrets
 import time
-from email.utils import parsedate_to_datetime
 from datetime import datetime, timedelta
+from html import escape
 
 import gradio as gr
 import pandas as pd
-from fastapi import FastAPI, Request
 import uvicorn
+from fastapi import FastAPI, Request
 from fastapi.responses import HTMLResponse
 from google_auth_oauthlib.flow import Flow
 from googleapiclient.discovery import build
 from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.naive_bayes import MultinomialNB
 from sklearn.pipeline import Pipeline
+from starlette.middleware.sessions import SessionMiddleware
+
+import mindsort_auth as auth
+import mindsort_folders as folders
 
 
 # ============================================================
@@ -40,9 +48,11 @@ DB = os.environ.get("MINDSORT_DB_PATH", "mindsort.db")
 MAX_MESSAGE_LENGTH = 5000
 GOOGLE_REDIRECT_URI = "https://mindsort-ai.onrender.com/oauth2callback"
 GMAIL_SCOPES = ["https://www.googleapis.com/auth/gmail.readonly"]
+GMAIL_SLOTS = ("Gmail account 1", "Gmail account 2")
+LOGIN_AGAIN = "Your session has ended. Please refresh the page and log in again."
 
-# OAuth credentials stay in server memory only. They are never written to
-# GitHub or displayed in the browser. Reconnect after a server restart.
+# Kept in server memory only, keyed by (user_id, slot). Each person can only
+# ever reach their own entries. Reconnect after a server restart.
 pending_oauth = {}
 gmail_connections = {}
 
@@ -58,10 +68,11 @@ def connect_db():
 def setup_database():
     conn = connect_db()
     cursor = conn.cursor()
-    
+
     cursor.execute("""
         CREATE TABLE IF NOT EXISTS messages (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER,
             message TEXT,
             category TEXT,
             is_task TEXT,
@@ -72,55 +83,52 @@ def setup_database():
         )
     """)
 
-    existing_columns = [
-        row[1] for row in cursor.execute(
-            "PRAGMA table_info(messages)"
-        ).fetchall()
-    ]
-
-    required_columns = {
+    existing = [r[1] for r in cursor.execute("PRAGMA table_info(messages)").fetchall()]
+    for column, definition in {
+        "user_id": "INTEGER",
         "priority": "TEXT DEFAULT 'Normal'",
         "completed": "INTEGER DEFAULT 0",
-        "created_at": "TEXT"
-    }
-
-    for column, definition in required_columns.items():
-        if column not in existing_columns:
-            cursor.execute(
-                f"ALTER TABLE messages ADD COLUMN {column} {definition}"
-            )
-
-    existing_columns = [
-        row[1] for row in cursor.execute(
-            "PRAGMA table_info(messages)"
-        ).fetchall()
-    ]
-    for column, definition in {
+        "created_at": "TEXT",
         "gmail_account": "TEXT",
-        "gmail_message_id": "TEXT"
+        "gmail_message_id": "TEXT",
     }.items():
-        if column not in existing_columns:
-            cursor.execute(
-                f"ALTER TABLE messages ADD COLUMN {column} {definition}"
-            )
+        if column not in existing:
+            cursor.execute(f"ALTER TABLE messages ADD COLUMN {column} {definition}")
 
+    # Old index ignored who owned the email; the new one is per user.
+    cursor.execute("DROP INDEX IF EXISTS idx_gmail_message_account")
     cursor.execute("""
-        CREATE UNIQUE INDEX IF NOT EXISTS idx_gmail_message_account
-        ON messages(gmail_account, gmail_message_id)
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_gmail_message_user
+        ON messages(user_id, gmail_account, gmail_message_id)
         WHERE gmail_message_id IS NOT NULL
     """)
+    cursor.execute("CREATE INDEX IF NOT EXISTS idx_messages_user ON messages(user_id)")
 
     conn.commit()
     conn.close()
 
 
 setup_database()
-
-
-import mindsort_folders as folders
+auth.init(connect_db)
 folders.init(connect_db)
 
-    
+
+def current_user_id(request):
+    """Who is making this request. Always taken from the signed login session."""
+    try:
+        raw = getattr(request, "username", None)
+        if not raw:
+            raw = request.request.session.get("user_id")
+        return int(raw)
+    except Exception:
+        return None
+
+
+def current_username(request):
+    try:
+        return request.request.session.get("username") or ""
+    except Exception:
+        return ""
 
 
 # ============================================================
@@ -176,19 +184,13 @@ def classify_message(message):
 def detect_priority(message):
     text = message.lower()
 
-    if any(word in text for word in [
-        "urgent", "asap", "immediately", "critical"
-    ]):
+    if any(word in text for word in ["urgent", "asap", "immediately", "critical"]):
         return "High"
 
-    if any(word in text for word in [
-        "tomorrow", "important", "soon", "upcoming"
-    ]):
+    if any(word in text for word in ["tomorrow", "important", "soon", "upcoming"]):
         return "Medium"
 
-    if any(word in text for word in [
-        "optional", "whenever", "later", "no hurry"
-    ]):
+    if any(word in text for word in ["optional", "whenever", "later", "no hurry"]):
         return "Low"
 
     return "Normal"
@@ -200,7 +202,6 @@ def detect_task(message):
         "register", "pay", "buy", "finish",
         "download", "meeting", "deadline"
     ]
-
     text = message.lower()
     return "Yes" if any(word in text for word in words) else "No"
 
@@ -221,7 +222,11 @@ def detect_deadline(message):
 # 5. ORGANIZE AND SAVE MESSAGE
 # ============================================================
 
-def organize_message(message):
+def organize_message(message, request: gr.Request):
+    user_id = current_user_id(request)
+    if not user_id:
+        return LOGIN_AGAIN
+
     if not message or not message.strip():
         return "Please enter a message."
 
@@ -236,21 +241,14 @@ def organize_message(message):
     deadline = detect_deadline(message)
 
     conn = connect_db()
-    cursor = conn.cursor()
-
-    cursor.execute("""
+    conn.execute("""
         INSERT INTO messages
-        (message, category, is_task, deadline, priority, created_at)
-        VALUES (?, ?, ?, ?, ?, ?)
+        (user_id, message, category, is_task, deadline, priority, created_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?)
     """, (
-        message,
-        category_name,
-        task,
-        deadline,
-        priority,
+        user_id, message, category_name, task, deadline, priority,
         datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     ))
-
     conn.commit()
     conn.close()
 
@@ -269,16 +267,18 @@ def organize_message(message):
 # 6. TASKS AND REMINDERS
 # ============================================================
 
-def get_reminders():
-    conn = connect_db()
+def get_reminders(request: gr.Request):
+    user_id = current_user_id(request)
+    if not user_id:
+        return LOGIN_AGAIN
 
+    conn = connect_db()
     df = pd.read_sql_query("""
         SELECT id, message, deadline, priority
         FROM messages
-        WHERE is_task = 'Yes' AND completed = 0
+        WHERE user_id = ? AND is_task = 'Yes' AND completed = 0
         ORDER BY id DESC
-    """, conn)
-
+    """, conn, params=(user_id,))
     conn.close()
 
     if df.empty:
@@ -287,7 +287,11 @@ def get_reminders():
     return df.to_string(index=False)
 
 
-def complete_task(task_id):
+def complete_task(task_id, request: gr.Request):
+    user_id = current_user_id(request)
+    if not user_id:
+        return LOGIN_AGAIN
+
     if task_id is None:
         return "Please enter a task ID."
 
@@ -298,38 +302,33 @@ def complete_task(task_id):
 
     conn = connect_db()
     cursor = conn.cursor()
-
-    cursor.execute("""
-        UPDATE messages
-        SET completed = 1
-        WHERE id = ?
-    """, (task_id,))
-
+    cursor.execute(
+        "UPDATE messages SET completed = 1 WHERE id = ? AND user_id = ?",
+        (task_id, user_id)
+    )
     conn.commit()
     changed = cursor.rowcount
     conn.close()
 
-    if changed:
-        return "Task marked as completed."
-
-    return "Task ID not found."
+    return "Task marked as completed." if changed else "Task ID not found."
 
 
 # ============================================================
 # 7. SEARCH AND FILTERS
 # ============================================================
 
-def advanced_search(keyword, category_name, priority_name):
-    conn = connect_db()
+def advanced_search(keyword, category_name, priority_name, request: gr.Request):
+    user_id = current_user_id(request)
+    if not user_id:
+        return pd.DataFrame()
 
     query = """
         SELECT id, message, category, is_task,
                deadline, priority, completed
         FROM messages
-        WHERE 1=1
+        WHERE user_id = ?
     """
-
-    values = []
+    values = [user_id]
 
     if keyword and keyword.strip():
         query += " AND message LIKE ?"
@@ -345,9 +344,9 @@ def advanced_search(keyword, category_name, priority_name):
 
     query += " ORDER BY id DESC"
 
+    conn = connect_db()
     df = pd.read_sql_query(query, conn, params=values)
     conn.close()
-
     return df
 
 
@@ -355,9 +354,14 @@ def advanced_search(keyword, category_name, priority_name):
 # 8. DASHBOARD
 # ============================================================
 
-def dashboard():
+def dashboard(request: gr.Request):
+    user_id = current_user_id(request)
+    if not user_id:
+        return LOGIN_AGAIN
+
     conn = connect_db()
-    df = pd.read_sql_query("SELECT * FROM messages", conn)
+    df = pd.read_sql_query("SELECT * FROM messages WHERE user_id = ?",
+                           conn, params=(user_id,))
     conn.close()
 
     if df.empty:
@@ -392,7 +396,7 @@ def dashboard():
 
 
 # ============================================================
-# 9. GMAIL OAUTH AND READ-ONLY INBOX IMPORT
+# 9. GMAIL OAUTH AND READ-ONLY INBOX IMPORT (per user)
 # ============================================================
 
 def make_google_flow(state=None):
@@ -415,17 +419,17 @@ def make_google_flow(state=None):
         }
     }
 
-    flow = Flow.from_client_config(
-        client_config,
-        scopes=GMAIL_SCOPES,
-        state=state
-    )
+    flow = Flow.from_client_config(client_config, scopes=GMAIL_SCOPES, state=state)
     flow.redirect_uri = GOOGLE_REDIRECT_URI
     return flow
 
 
-def start_gmail_connection(account_slot):
-    if account_slot not in ("Gmail account 1", "Gmail account 2"):
+def start_gmail_connection(account_slot, request: gr.Request):
+    user_id = current_user_id(request)
+    if not user_id:
+        return LOGIN_AGAIN
+
+    if account_slot not in GMAIL_SLOTS:
         return "Please choose Gmail account 1 or Gmail account 2."
 
     try:
@@ -435,7 +439,13 @@ def start_gmail_connection(account_slot):
             include_granted_scopes="true",
             prompt="consent"
         )
+        # Drop old unfinished attempts so this dictionary cannot grow forever.
+        for key in [k for k, v in pending_oauth.items()
+                    if time.time() - v["created_at"] > 600]:
+            pending_oauth.pop(key, None)
+
         pending_oauth[state] = {
+            "user_id": user_id,
             "account_slot": account_slot,
             "created_at": time.time(),
             "flow": flow
@@ -447,7 +457,6 @@ def start_gmail_connection(account_slot):
             "Return here after approval."
         )
     except Exception as error:
-        
         return f"Could not start Google authorization: {str(error)}"
 
 
@@ -470,20 +479,25 @@ def gmail_oauth_callback(request: Request):
             "<p>Return to MindSort AI and start the connection again.</p>",
             status_code=400
         )
+
+    # The person finishing the connection must be the one who started it.
+    if auth.session_user_id(request) != pending["user_id"]:
+        return HTMLResponse(
+            "<h2>Please log in to MindSort AI first.</h2>"
+            "<p>Log in with the account that started this connection, then try again.</p>",
+            status_code=403
+        )
+
     try:
         flow = pending["flow"]
         flow.fetch_token(code=code)
         credentials = flow.credentials
 
-        service = build(
-            "gmail", "v1", credentials=credentials,
-            cache_discovery=False
-        )
-
+        service = build("gmail", "v1", credentials=credentials, cache_discovery=False)
         profile = service.users().getProfile(userId="me").execute()
         gmail_address = profile.get("emailAddress", "Connected Google account")
 
-        gmail_connections[pending["account_slot"]] = {
+        gmail_connections[(pending["user_id"], pending["account_slot"])] = {
             "credentials": credentials,
             "email": gmail_address
         }
@@ -491,24 +505,29 @@ def gmail_oauth_callback(request: Request):
         return HTMLResponse(
             "<html><body style='font-family:Arial;padding:32px'>"
             "<h2>Gmail connected successfully!</h2>"
-            f"<p>{pending['account_slot']} is connected as "
-            f"<b>{gmail_address}</b>.</p>"
-            "<p>You can close this tab and return to MindSort AI.</p>"
+            f"<p>{escape(pending['account_slot'])} is connected as "
+            f"<b>{escape(gmail_address)}</b>.</p>"
+            "<p><a href='/app/'>Return to MindSort AI</a></p>"
             "</body></html>"
         )
 
-    except Exception as error:
-        print("GMAIL OAUTH CALLBACK ERROR:", repr(error), flush=True)
+    except Exception as err:
+        print("GMAIL OAUTH CALLBACK ERROR:", repr(err), flush=True)
         return HTMLResponse(
             "<h2>Could not complete Gmail connection.</h2>"
             "<p>Check the Render logs for the error.</p>",
             status_code=400
         )
-        
-def gmail_connection_status():
+
+
+def gmail_connection_status(request: gr.Request):
+    user_id = current_user_id(request)
+    if not user_id:
+        return LOGIN_AGAIN
+
     lines = ["## Gmail connections"]
-    for slot in ("Gmail account 1", "Gmail account 2"):
-        connection = gmail_connections.get(slot)
+    for slot in GMAIL_SLOTS:
+        connection = gmail_connections.get((user_id, slot))
         if connection:
             lines.append(f"- **{slot}:** Connected ({connection['email']})")
         else:
@@ -542,8 +561,13 @@ def decode_gmail_body(payload):
     walk(payload)
     return "\n".join(chunks).strip()
 
-def fetch_and_organize_gmail(account_slot, max_emails):
-    connection = gmail_connections.get(account_slot)
+
+def fetch_and_organize_gmail(account_slot, max_emails, request: gr.Request):
+    user_id = current_user_id(request)
+    if not user_id:
+        return LOGIN_AGAIN
+
+    connection = gmail_connections.get((user_id, account_slot))
     if not connection:
         return f"**{account_slot} is not connected yet.** Use the Connect button first."
 
@@ -576,8 +600,13 @@ def fetch_and_organize_gmail(account_slot, max_emails):
         results = []
         conn = connect_db()
         cursor = conn.cursor()
+        email = connection["email"]
 
         for ref in message_refs:
+            if folders.has_card(cursor, user_id, email, ref["id"]):
+                skipped += 1
+                continue
+
             item = service.users().messages().get(
                 userId="me", id=ref["id"], format="full"
             ).execute()
@@ -593,7 +622,7 @@ def fetch_and_organize_gmail(account_slot, max_emails):
             content = content[:MAX_MESSAGE_LENGTH]
 
             folders.save_folder_card(
-                cursor, connection["email"], item["id"], subject, sender,
+                cursor, user_id, email, item["id"], subject, sender,
                 body or snippet,
                 datetime.fromtimestamp(int(item.get("internalDate", 0)) / 1000)
             )
@@ -605,13 +634,13 @@ def fetch_and_organize_gmail(account_slot, max_emails):
 
             cursor.execute("""
                 INSERT OR IGNORE INTO messages
-                (message, category, is_task, deadline, priority,
+                (user_id, message, category, is_task, deadline, priority,
                  created_at, gmail_account, gmail_message_id)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
             """, (
-                content, category_name, task, deadline, priority,
+                user_id, content, category_name, task, deadline, priority,
                 datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-                connection["email"], item["id"]
+                email, item["id"]
             ))
 
             if cursor.rowcount:
@@ -628,7 +657,7 @@ def fetch_and_organize_gmail(account_slot, max_emails):
         conn.close()
         summary = [
             f"## Gmail organization complete: {account_slot}",
-            f"- Account: **{connection['email']}**",
+            f"- Account: **{email}**",
             f"- New messages organized: **{imported}**",
             f"- Already imported: **{skipped}**",
             "- Gmail mailbox changes: **None (read-only access)**",
@@ -643,13 +672,6 @@ def fetch_and_organize_gmail(account_slot, max_emails):
         )
 
 
-def gmail_setup_information():
-    return (
-        "Gmail uses Google's official OAuth flow and requests only the "
-        "gmail.readonly permission. Connect either account below."
-    )
-
-
 # ============================================================
 # 10. APPLICATION TESTS
 # ============================================================
@@ -658,28 +680,27 @@ def run_tests():
     tests = []
 
     try:
-        category_name, confidence = classify_message(
-            "Complete mathematics homework"
-        )
+        category_name, confidence = classify_message("Complete mathematics homework")
         tests.append(("AI classification", category_name == "Study"))
-
-        tests.append((
-            "Priority detection",
-            detect_priority("Urgent assignment") == "High"
-        ))
-
-        tests.append((
-            "Task detection",
-            detect_task("Submit assignment") == "Yes"
-        ))
-
+        tests.append(("Priority detection", detect_priority("Urgent assignment") == "High"))
+        tests.append(("Task detection", detect_task("Submit assignment") == "Yes"))
         tests.append((
             "Deadline detection",
             detect_deadline("Complete this tomorrow") != "Not specified"
         ))
+        tests.append((
+            "Password hashing",
+            auth.check_password("a-long-test-password", auth.hash_password("a-long-test-password"))
+            and not auth.check_password("wrong", auth.hash_password("a-long-test-password"))
+        ))
+        tests.append((
+            "Folder classification",
+            folders.classify_folder("National Hackathon", "Register for the hackathon") == "Hackathon"
+        ))
 
         conn = connect_db()
         conn.execute("SELECT * FROM messages LIMIT 1")
+        conn.execute("SELECT * FROM users LIMIT 1")
         conn.close()
         tests.append(("Database connection", True))
 
@@ -693,29 +714,28 @@ def run_tests():
 
 
 # ============================================================
-# 11. CSV EXPORT
+# 11. CSV EXPORT (own data only)
 # ============================================================
 
-def export_messages():
+def export_messages(request: gr.Request):
+    user_id = current_user_id(request)
+    if not user_id:
+        return None
+
     conn = connect_db()
-
     df = pd.read_sql_query(
-        "SELECT * FROM messages ORDER BY id DESC",
-        conn
+        "SELECT id, message, category, is_task, deadline, priority, completed, "
+        "created_at, gmail_account FROM messages WHERE user_id = ? ORDER BY id DESC",
+        conn, params=(user_id,)
     )
-
     conn.close()
 
     if df.empty:
         return None
 
     with tempfile.NamedTemporaryFile(
-        mode="w",
-        suffix=".csv",
-        prefix="MindSort_AI_Export_",
-        delete=False,
-        encoding="utf-8-sig",
-        newline=""
+        mode="w", suffix=".csv", prefix="MindSort_AI_Export_",
+        delete=False, encoding="utf-8-sig", newline=""
     ) as file:
         df.to_csv(file.name, index=False)
         return file.name
@@ -729,28 +749,61 @@ def deployment_information():
     return """
 ## Deployment checklist
 
-- Login protection is enabled using Render environment variables.
-- Test all application features after deployment.
-- Configure persistent database storage before relying on saved messages.
+- Every person signs up with their own username and password.
+- Messages, folders and Gmail connections are private to each user.
 - Gmail uses official Google OAuth with read-only permission.
 - OAuth credentials are kept in server memory, not source code.
-- Reconnect Gmail accounts after a Render restart or redeploy.
-- Configure persistent database storage before relying on saved messages.
-- Keep API keys and secrets out of source code.
+- Reconnect Gmail after a Render restart or redeploy.
+- Use a Render Disk and set MINDSORT_DB_PATH, otherwise accounts and
+  messages are erased on every redeploy.
+- Set MINDSORT_SECRET_KEY so logins survive restarts.
+- Set MINDSORT_INVITE_CODE to limit who can create an account.
+- While Google's consent screen is in Testing mode, add each person's
+  Gmail address as a test user in Google Cloud.
 
-Gmail import processes up to 25 recent inbox messages per run. It does not
+Gmail import processes up to 100 recent inbox messages per run. It does not
 send, delete, archive, or modify Gmail messages. WhatsApp is not connected.
 """
 
 
 # ============================================================
-# 13. GRADIO USER INTERFACE
+# 13. FOLDERS TAB HANDLERS
 # ============================================================
 
-with gr.Blocks(
-    title="MindSort AI",
-    theme=gr.themes.Soft()
-) as app:
+def folders_refresh(account, request: gr.Request):
+    user_id = current_user_id(request)
+    accounts = folders.list_accounts(user_id)
+    if account not in accounts:
+        account = accounts[0] if accounts else None
+    choices = folders.folder_choices(user_id, account)
+    page = "" if choices else folders.message_html(
+        "No folders yet. Go to the Gmail tab, fetch your inbox, then press Refresh folders."
+    )
+    return (gr.update(choices=accounts, value=account),
+            gr.update(choices=choices, value=None), page)
+
+
+def folders_change_account(account, request: gr.Request):
+    user_id = current_user_id(request)
+    return (gr.update(choices=folders.folder_choices(user_id, account), value=None),
+            folders.message_html("Choose a folder to see its emails."))
+
+
+def folders_show(account, folder_label, keyword, sort_by, request: gr.Request):
+    return folders.render_folder(current_user_id(request), account,
+                                 folder_label, keyword, sort_by)
+
+
+def who_am_i(request: gr.Request):
+    name = escape(current_username(request))
+    return f"Signed in as **{name}** &nbsp;|&nbsp; [Log out](/logout)"
+
+
+# ============================================================
+# 14. GRADIO USER INTERFACE
+# ============================================================
+
+with gr.Blocks(title="MindSort AI", theme=gr.themes.Soft()) as app:
 
     gr.Markdown("""
     # 🧠 MindSort AI
@@ -758,6 +811,7 @@ with gr.Blocks(
 
     Organize messages, manage tasks and explore your productivity.
     """)
+    who_md = gr.Markdown()
 
     with gr.Tabs():
 
@@ -769,65 +823,35 @@ with gr.Blocks(
                 lines=4,
                 max_lines=8
             )
-
-            organize_button = gr.Button(
-                "Organize Message",
-                variant="primary"
-            )
-
+            organize_button = gr.Button("Organize Message", variant="primary")
             organize_output = gr.Markdown()
-
-            organize_button.click(
-                organize_message,
-                inputs=message,
-                outputs=organize_output
-            )
+            organize_button.click(organize_message, inputs=message, outputs=organize_output)
 
         # TASKS
         with gr.Tab("📋 Tasks"):
             gr.Markdown("## Pending tasks")
-
             task_button = gr.Button("Refresh Tasks")
             task_output = gr.Textbox(lines=12)
+            task_button.click(get_reminders, outputs=task_output)
 
-            task_button.click(
-                get_reminders,
-                outputs=task_output
-            )
-
-            task_id = gr.Number(
-                label="Task ID to complete",
-                precision=0
-            )
-
+            task_id = gr.Number(label="Task ID to complete", precision=0)
             complete_button = gr.Button("Mark Completed")
             complete_output = gr.Textbox()
-
-            complete_button.click(
-                complete_task,
-                inputs=task_id,
-                outputs=complete_output
-            )
+            complete_button.click(complete_task, inputs=task_id, outputs=complete_output)
 
         # SEARCH
         with gr.Tab("🔍 Search"):
             keyword = gr.Textbox(label="Search keyword")
-
             category = gr.Dropdown(
                 ["All", "Study", "Hackathon", "Events", "Work", "Home"],
-                value="All",
-                label="Category"
+                value="All", label="Category"
             )
-
             priority = gr.Dropdown(
                 ["All", "High", "Medium", "Low", "Normal"],
-                value="All",
-                label="Priority"
+                value="All", label="Priority"
             )
-
             search_button = gr.Button("Search")
             search_output = gr.Dataframe()
-
             search_button.click(
                 advanced_search,
                 inputs=[keyword, category, priority],
@@ -838,21 +862,13 @@ with gr.Blocks(
         with gr.Tab("📊 Dashboard"):
             dashboard_button = gr.Button("Refresh Dashboard")
             dashboard_output = gr.Markdown()
-
-            dashboard_button.click(
-                dashboard,
-                outputs=dashboard_output
-            )
+            dashboard_button.click(dashboard, outputs=dashboard_output)
 
         # EXPORT
         with gr.Tab("📥 Export"):
             export_button = gr.Button("Export CSV")
             export_output = gr.File()
-
-            export_button.click(
-                export_messages,
-                outputs=export_output
-            )
+            export_button.click(export_messages, outputs=export_output)
 
         # GMAIL
         with gr.Tab("📧 Gmail"):
@@ -866,31 +882,22 @@ with gr.Blocks(
             """)
 
             gmail_account = gr.Radio(
-                ["Gmail account 1", "Gmail account 2"],
-                value="Gmail account 1",
+                list(GMAIL_SLOTS), value="Gmail account 1",
                 label="Choose which account to connect"
             )
-            connect_gmail_button = gr.Button(
-                "Connect selected Gmail account", variant="primary"
-            )
+            connect_gmail_button = gr.Button("Connect selected Gmail account", variant="primary")
             gmail_connect_output = gr.Markdown()
             connect_gmail_button.click(
-                start_gmail_connection,
-                inputs=gmail_account,
-                outputs=gmail_connect_output
+                start_gmail_connection, inputs=gmail_account, outputs=gmail_connect_output
             )
 
             status_button = gr.Button("Refresh connection status")
             gmail_status_output = gr.Markdown()
-            status_button.click(
-                gmail_connection_status,
-                outputs=gmail_status_output
-            )
+            status_button.click(gmail_connection_status, outputs=gmail_status_output)
 
             gr.Markdown("---\n## Organize inbox messages")
             fetch_account = gr.Dropdown(
-                ["Gmail account 1", "Gmail account 2"],
-                value="Gmail account 1",
+                list(GMAIL_SLOTS), value="Gmail account 1",
                 label="Select connected inbox"
             )
             email_count = gr.Slider(
@@ -905,57 +912,72 @@ with gr.Blocks(
                 outputs=fetch_output
             )
 
-        
         # FOLDERS
         with gr.Tab("📁 Folders"):
             gr.Markdown("Pick an account, then click a folder to open it.")
             with gr.Row():
-                fc_account = gr.Dropdown(choices=folders.list_accounts(), label="Gmail account")
+                fc_account = gr.Dropdown(choices=[], label="Gmail account")
                 fc_refresh = gr.Button("Refresh folders")
             fc_folders = gr.Radio(choices=[], label="Folders")
             with gr.Row():
                 fc_keyword = gr.Textbox(label="Search keyword")
-                fc_sort = gr.Dropdown(folders.SORT_OPTIONS, value=folders.SORT_OPTIONS[0], label="Sort by")
+                fc_sort = gr.Dropdown(
+                    folders.SORT_OPTIONS, value=folders.SORT_OPTIONS[0], label="Sort by"
+                )
             fc_cards = gr.HTML()
 
-            fc_refresh.click(folders.refresh_folders, fc_account, [fc_account, fc_folders, fc_cards])
-            fc_account.change(folders.change_account, fc_account, [fc_folders, fc_cards])
+            fc_refresh.click(folders_refresh, fc_account, [fc_account, fc_folders, fc_cards])
+            fc_account.change(folders_change_account, fc_account, [fc_folders, fc_cards])
             show = [fc_account, fc_folders, fc_keyword, fc_sort]
-            fc_folders.change(folders.render_folder, show, fc_cards)
-            fc_keyword.submit(folders.render_folder, show, fc_cards)
-            fc_sort.change(folders.render_folder, show, fc_cards)
+            fc_folders.change(folders_show, show, fc_cards)
+            fc_keyword.submit(folders_show, show, fc_cards)
+            fc_sort.change(folders_show, show, fc_cards)
+
         # TESTING
         with gr.Tab("🧪 Testing"):
             test_button = gr.Button("Run Tests")
             test_output = gr.Textbox(lines=8)
-
-            test_button.click(
-                run_tests,
-                outputs=test_output
-            )
+            test_button.click(run_tests, outputs=test_output)
 
         # DEPLOYMENT
         with gr.Tab("🚀 Deployment"):
-            deployment_button = gr.Button(
-                "View Deployment Checklist"
-            )
-
+            deployment_button = gr.Button("View Deployment Checklist")
             deployment_output = gr.Markdown()
-
-            deployment_button.click(
-                deployment_information,
-                outputs=deployment_output
-            )
+            deployment_button.click(deployment_information, outputs=deployment_output)
 
     gr.Markdown("""
     ---
     **MindSort AI | Smart Message Management**
     """)
 
+    # Runs each time a page opens, for the person who opened it.
+    app.load(who_am_i, None, who_md)
+    app.load(folders_refresh, fc_account, [fc_account, fc_folders, fc_cards])
 
-# Register Google's OAuth callback on the same FastAPI app used by Gradio.
-# Our own FastAPI server holds the OAuth callback; Gradio is mounted onto it.
+
+# ============================================================
+# 15. SERVER: LOGIN PAGES + GRADIO BEHIND LOGIN
+# ============================================================
+
 server = FastAPI()
+
+secret_key = os.environ.get("MINDSORT_SECRET_KEY")
+if not secret_key:
+    secret_key = secrets.token_hex(32)
+    print("WARNING: MINDSORT_SECRET_KEY is not set. Everyone will be logged out "
+          "whenever the server restarts.", flush=True)
+
+server.add_middleware(
+    SessionMiddleware,
+    secret_key=secret_key,
+    session_cookie="mindsort_session",
+    max_age=7 * 24 * 3600,
+    same_site="lax",
+    https_only=os.environ.get("MINDSORT_ALLOW_HTTP") != "1",
+)
+
+auth.register_routes(server)          # /, /login, /signup, /logout
+
 server.add_api_route(
     "/oauth2callback",
     gmail_oauth_callback,
@@ -963,35 +985,16 @@ server.add_api_route(
     response_class=HTMLResponse
 )
 
+mounted = gr.mount_gradio_app(
+    server, app, path="/app", auth_dependency=auth.require_user
+)
 
-# ============================================================
-# 14. START SERVER WITH LOGIN PROTECTION
-# ============================================================
+
 if __name__ == "__main__":
-    username = os.environ.get("MINDSORT_USERNAME")
-    password = os.environ.get("MINDSORT_PASSWORD")
-
-    if not username or not password:
-        raise RuntimeError(
-            "Login credentials are missing. In Render, add the "
-            "MINDSORT_USERNAME and MINDSORT_PASSWORD environment "
-            "variables, then redeploy."
-        )
-
-    if len(password) < 12:
-        raise RuntimeError(
-            "MINDSORT_PASSWORD must be at least 12 characters long. "
-            "Set a longer unique password in Render."
-        )
-
-    mounted = gr.mount_gradio_app(
-        server, app, path="/", auth=(username, password)
-    )
-
     uvicorn.run(
         mounted,
         host="0.0.0.0",
-        port=int(os.environ.get("PORT", 10000))
+        port=int(os.environ.get("PORT", 10000)),
+        proxy_headers=True,
+        forwarded_allow_ips="*"
     )
-
-    
