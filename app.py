@@ -58,7 +58,7 @@ def connect_db():
 def setup_database():
     conn = connect_db()
     cursor = conn.cursor()
-
+    
     cursor.execute("""
         CREATE TABLE IF NOT EXISTS messages (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -115,6 +115,12 @@ def setup_database():
 
 
 setup_database()
+
+
+import mindsort_folders as folders
+folders.init(connect_db)
+
+    
 
 
 # ============================================================
@@ -578,7 +584,14 @@ def fetch_and_organize_gmail(account_slot, max_emails):
             content = f"Subject: {subject}\nFrom: {sender}\n\n{body or snippet}"
             content = content[:MAX_MESSAGE_LENGTH]
 
+            folders.save_folder_card(
+                cursor, connection["email"], item["id"], subject, sender,
+                body or snippet,
+                datetime.fromtimestamp(int(item.get("internalDate", 0)) / 1000)
+            )
+
             category_name, confidence = classify_message(content)
+            
             priority = detect_priority(content)
             task = detect_task(content)
             deadline = detect_deadline(content)
@@ -885,6 +898,25 @@ with gr.Blocks(
                 outputs=fetch_output
             )
 
+        
+        # FOLDERS
+        with gr.Tab("📁 Folders"):
+            gr.Markdown("Pick an account, then click a folder to open it.")
+            with gr.Row():
+                fc_account = gr.Dropdown(choices=folders.list_accounts(), label="Gmail account")
+                fc_refresh = gr.Button("Refresh folders")
+            fc_folders = gr.Radio(choices=[], label="Folders")
+            with gr.Row():
+                fc_keyword = gr.Textbox(label="Search keyword")
+                fc_sort = gr.Dropdown(folders.SORT_OPTIONS, value=folders.SORT_OPTIONS[0], label="Sort by")
+            fc_cards = gr.HTML()
+
+            fc_refresh.click(folders.refresh_folders, fc_account, [fc_account, fc_folders, fc_cards])
+            fc_account.change(folders.change_account, fc_account, [fc_folders, fc_cards])
+            show = [fc_account, fc_folders, fc_keyword, fc_sort]
+            fc_folders.change(folders.render_folder, show, fc_cards)
+            fc_keyword.submit(folders.render_folder, show, fc_cards)
+            fc_sort.change(folders.render_folder, show, fc_cards)
         # TESTING
         with gr.Tab("🧪 Testing"):
             test_button = gr.Button("Run Tests")
